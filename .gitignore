@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.log
+*.pid
+config.json
+api-key.txt
+persona.txt.bak

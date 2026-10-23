@@ -253,6 +253,44 @@ def spawn_detached(cmd, cwd=None):
         devnull.close()
 
 
+def spawn_wmi(cmdline):
+    """
+    WMI Win32_Process.Create 拉进程，返回 pid（失败 None）。
+
+    DETACHED_PROCESS 只脱离控制台、不脱离作业对象(Job Object)：本服务如果是被
+    IDE / 终端 / 调度器以作业方式拉起的，它 Popen 出来的子进程仍在同一个作业里，
+    外层一收摊整棵树就被终止（症状：start 成功、几秒后端口没了）。
+    WMI 创建的进程挂在 wmiprvse.exe 名下，不属于我们的作业，能真正活下来。
+    """
+    q = "'" + cmdline.replace("'", "''") + "'"
+    ps = ("$r = ([wmiclass]'root\\cimv2:Win32_Process').Create(%s); "
+          "if ($r.ReturnValue -eq 0) { $r.ProcessId } else { -1 }") % q
+    try:
+        r = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps],
+                           capture_output=True, text=True, timeout=90, env=clean_env())
+        pid = int((r.stdout or "-1").strip().splitlines()[-1])
+    except Exception:
+        return None
+    return pid if pid > 0 else None
+
+
+def start_relay(relay_dir, port):
+    """拉起反代；常规 Popen 起不来时自动换 WMI 重投。返回是否成功。"""
+    launcher = str(relay_dir / "start-relay.cmd")
+    spawn_detached(["cmd.exe", "/c", launcher], cwd=str(relay_dir))
+    for _ in range(20):
+        if port_listening(port):
+            return True
+        time.sleep(0.5)
+    pid = spawn_wmi('cmd.exe /c "%s"' % launcher)
+    if pid:
+        for _ in range(40):
+            if port_listening(port):
+                return True
+            time.sleep(0.5)
+    return port_listening(port)
+
+
 def run(cmd, timeout=180):
     try:
         return subprocess.run(cmd, env=clean_env(), capture_output=True, text=True,
@@ -444,12 +482,7 @@ def do_deploy(cfg):
     if port_listening(port):
         log(f"端口 {port} 已在监听，跳过启动", "warn")
     else:
-        spawn_detached(["cmd.exe", "/c", str(relay_dir / "start-relay.cmd")], cwd=str(relay_dir))
-        for _ in range(40):
-            if port_listening(port):
-                break
-            time.sleep(0.5)
-        if not port_listening(port):
+        if not start_relay(relay_dir, port):
             log(f"启动超时，看日志 {relay_dir / 'server.log'}", "err")
             return False
         log(f"反代已启动（端口 {port}）", "ok")
@@ -651,12 +684,7 @@ class Handler(BaseHTTPRequestHandler):
                 if port_listening(port):
                     log(f"端口 {port} 已在监听", "warn")
                 else:
-                    spawn_detached(["cmd.exe", "/c", str(relay_dir / "start-relay.cmd")],
-                                   cwd=str(relay_dir))
-                    for _ in range(40):
-                        if port_listening(port):
-                            break
-                        time.sleep(0.5)
+                    start_relay(relay_dir, port)
                     log(f"反代 {'已启动' if port_listening(port) else '启动失败'}（端口 {port}）",
                         "ok" if port_listening(port) else "err")
                 job_end("start")

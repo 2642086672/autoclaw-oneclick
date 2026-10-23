@@ -348,14 +348,51 @@ def spawn_detached(cmd, cwd=None):
         devnull.close()
 
 
+def _ps_single_quote(s):
+    """PowerShell 单引号字面量转义：内部单引号写成两个。"""
+    return "'" + s.replace("'", "''") + "'"
+
+
+def spawn_wmi(cmdline):
+    """
+    用 WMI Win32_Process.Create 拉进程，返回 pid（失败返回 None）。
+
+    为什么还要这一层：DETACHED_PROCESS 只脱离控制台，不脱离作业对象(Job Object)。
+    当本程序是被 IDE / 终端 / 调度器以作业方式拉起时，它 Popen 出来的子进程仍在
+    同一个作业里，外层一收摊就整棵树被终止（表现：start 成功、3 秒后端口没了）。
+    WMI 创建的进程挂在 wmiprvse.exe 名下，不属于我们的作业，所以能真正活下来。
+    """
+    ps = (
+        "$r = ([wmiclass]'root\\cimv2:Win32_Process').Create(%s); "
+        "if ($r.ReturnValue -eq 0) { $r.ProcessId } else { -1 }"
+    ) % _ps_single_quote(cmdline)
+    try:
+        r = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps],
+            capture_output=True, text=True, timeout=90,
+        )
+        pid = int((r.stdout or "-1").strip().splitlines()[-1])
+    except Exception:
+        return None
+    return pid if pid > 0 else None
+
+
 def start_services():
     if port_listening(PORT):
         return True, "反代已经在跑了"
-    spawn_detached(["cmd.exe", "/c", str(RELAY_DIR / "start-relay.cmd")], cwd=str(RELAY_DIR))
-    for _ in range(30):
+    launcher = str(RELAY_DIR / "start-relay.cmd")
+    spawn_detached(["cmd.exe", "/c", launcher], cwd=str(RELAY_DIR))
+    for _ in range(20):
         if port_listening(PORT):
             return True, f"反代已启动（端口 {PORT}）"
         time.sleep(0.5)
+    # 常规 Popen 起不来（进程被外层作业对象带走）时，换 WMI 再投一次
+    pid = spawn_wmi('cmd.exe /c "%s"' % launcher)
+    if pid:
+        for _ in range(40):
+            if port_listening(PORT):
+                return True, f"反代已启动（端口 {PORT}，WMI 托管 pid {pid}）"
+            time.sleep(0.5)
     return False, f"启动超时，看日志 {RELAY_DIR / 'server.log'}"
 
 

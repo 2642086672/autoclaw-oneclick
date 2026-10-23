@@ -1464,8 +1464,11 @@ function normalizeRoute(model) {
   if (/auto[\s_\-.]?fast/.test(s)) return pick("zai_auto-fast");
   if (/\bauto\b/.test(s)) return pick("zai_auto");
   if (/glm|zai/.test(s)) return pick(DEFAULT_ROUTE);
-  // 6) 原样透传（假定调用方给的已是 route id）
-  return raw;
+  // 6) 未识别的模型名（gpt-4o-mini / claude-* / qwen 等）：不能原样透传——
+  //    上游会报 400「非法模型」。兜到 zai_auto（自动路由），调用方至少能用。
+  //    日志里提一句，方便发现"客户端没配对模型名"。
+  log(`model "${raw}" 不在目录里，兜底到 zai_auto`);
+  return pick("zai_auto");
 
   function pick(want) {
     return known.find((id) => id === want) || want;
@@ -2561,6 +2564,38 @@ async function handleResponses(req, res, body) {
   }
 }
 
+// [imgfix] OpenAI 直通路径的消息归一化：
+// 客户端对 OpenAI 多模态格式的实现五花八门，透传前统一规整，否则上游 500 "parse response failed"：
+//   1) content 为空数组 -> 置空串（上游不接受 []）
+//   2) image_url 简写（字符串而非 {url} 对象）-> 包成标准对象
+//   3) 无效图片 part（缺 url / 空 data）-> 丢弃并记日志，不整包报错
+function normalizeOpenaiImageParts(messages) {
+  if (!Array.isArray(messages)) return messages;
+  for (const m of messages) {
+    if (!m || !Array.isArray(m.content)) continue;
+    const kept = [];
+    for (const b of m.content) {
+      if (!b || typeof b !== "object") { kept.push(b); continue; }
+      if (b.type === "image_url") {
+        let u = b.image_url;
+        if (typeof u === "string") u = { url: u };                       // 简写 -> 标准对象
+        const urlStr = u && typeof u.url === "string" ? u.url.trim() : "";
+        if (!urlStr) { log("imgfix: 丢弃无效 image_url part（缺 url）"); continue; }
+        kept.push({ ...b, image_url: u });
+        continue;
+      }
+      // 个别客户端把 data URL 直接塞在 image 字段（非标）
+      if (b.type === "image" && typeof b.url === "string" && b.url) {
+        kept.push({ type: "image_url", image_url: { url: b.url } });
+        continue;
+      }
+      kept.push(b);
+    }
+    m.content = kept.length ? kept : "";
+  }
+  return messages;
+}
+
 async function handleChatCompletions(req, res, body) {
   let up = await getUpstream();
   if (!up) {
@@ -2571,6 +2606,7 @@ async function handleChatCompletions(req, res, body) {
   const requested = body.model || DEFAULT_ROUTE;
   const route = normalizeRoute(requested);
   const isStream = Boolean(body.stream);
+  normalizeOpenaiImageParts(body.messages);   // [imgfix] 先归一化图片 part，再走后续流程
   const sizeErr = checkInputSize(body, false);
   if (sizeErr) return openaiError(res, sizeErr.code, sizeErr.message, sizeErr.type);
   const payload = { ...body, model: route };

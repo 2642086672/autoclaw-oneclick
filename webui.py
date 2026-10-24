@@ -438,39 +438,27 @@ def do_deploy(cfg):
         'set AUTOCLAW_LOG_FILE=%RELAY_DIR%\\server.log\r\n'
         'start "autoclaw-relay" /min "%NODE%" server.mjs\r\n'
         "endlocal\r\n", encoding="utf-8")
-    (relay_dir / "supervisor.cmd").write_text(
+    # 守护用 Python 版。老 .cmd 版的 findstr /R /C:":PORT .*LISTENING" 在 cmd 下
+    # 把 /C: 当"从文件读"，去找名为 `.*LISTENING"` 的文件 → 报错 → errorlevel 恒 1
+    # → 每 5 分钟无条件重启反代 → EADDRINUSE 自杀 + 多实例互踩，反代反复掉线。
+    sup_path = ASSETS / "supervisor.py"
+    sup_src = sup_path.read_text(encoding="utf-8", errors="replace")
+    sup_src = sup_src.replace(r"C:\Users\Administrator\.autoclaw-relay", str(relay_dir))
+    sup_src = sup_src.replace("PORT = 18766", f"PORT = {port}")
+    (relay_dir / "supervisor.py").write_text(sup_src, encoding="utf-8")
+
+    # 开机自启入口：拉起 Python 守护
+    (relay_dir / "autostart-supervisor.cmd").write_text(
         "@echo off\r\nsetlocal\r\n"
-        f"set RELAY_DIR={relay_dir}\r\n" + common +
-        "title AutoClaw 反代守护\r\n"
-        "echo AutoClaw 反代守护运行中（每 5 分钟自查，关窗口即停）\r\n"
-        ":loop\r\n"
-        f'  netstat -ano | findstr /R /C:":{port} .*LISTENING" >nul 2>&1\r\n'
-        "  if errorlevel 1 (\r\n"
-        '    echo [%time%] 反代未运行，拉起中...\r\n'
-        '    echo [%date% %time%] relay down >> "%RELAY_DIR%\\keepalive.log"\r\n'
-        '    call "%RELAY_DIR%\\start-relay.cmd" >nul 2>&1\r\n'
-        "  )\r\n"
-        "  set SPID=\r\n"
-        '  if exist "%RELAY_DIR%\\token-sync.pid" set /p SPID=<"%RELAY_DIR%\\token-sync.pid"\r\n'
-        "  if not defined SPID goto :start_sync\r\n"
-        '  tasklist /FI "PID eq %SPID%" 2>nul | findstr /I "python" >nul 2>&1\r\n'
-        "  if errorlevel 1 goto :start_sync\r\n"
-        "  goto :sleep\r\n"
-        "  :start_sync\r\n"
-        '  echo [%time%] 续期器未运行，拉起中...\r\n'
-        '  echo [%date% %time%] token-sync down >> "%RELAY_DIR%\\keepalive.log"\r\n'
-        '  cd /d "%RELAY_DIR%"\r\n'
-        '  start "autoclaw-token-sync" /min "%PY%" token-sync.py\r\n'
-        "  :sleep\r\n"
-        "  timeout /t 300 /nobreak >nul\r\n"
-        "  goto :loop\r\n"
+        f'set PY={py}\r\nset RELAY_DIR={relay_dir}\r\n'
+        'start "autoclaw-supervisor" /min "%PY%" "%RELAY_DIR%\\supervisor.py"\r\n'
         "endlocal\r\n", encoding="utf-8")
-    log("已写 start-relay.cmd / supervisor.cmd / token-sync.py", "ok")
+    log("已写 start-relay.cmd / supervisor.py / autostart-supervisor.cmd / token-sync.py", "ok")
 
     if cfg.get("autostart", True):
         try:
             STARTUP_DIR.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(relay_dir / "supervisor.cmd", STARTUP_DIR / AUTOSTART_NAME)
+            shutil.copy2(relay_dir / "autostart-supervisor.cmd", STARTUP_DIR / AUTOSTART_NAME)
             log(f"开机自启已装：{STARTUP_DIR / AUTOSTART_NAME}", "ok")
         except Exception as e:
             log(f"开机自启装不上：{e}", "warn")
@@ -725,7 +713,7 @@ class Handler(BaseHTTPRequestHandler):
             on = bool(body.get("on"))
             try:
                 if on:
-                    shutil.copy2(Path(cfg_of(body).get("relay_dir") or RELAY_DIR_DEFAULT) / "supervisor.cmd",
+                    shutil.copy2(Path(cfg_of(body).get("relay_dir") or RELAY_DIR_DEFAULT) / "autostart-supervisor.cmd",
                                  STARTUP_DIR / AUTOSTART_NAME)
                     log("开机自启已装", "ok")
                 else:

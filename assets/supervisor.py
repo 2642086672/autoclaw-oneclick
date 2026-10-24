@@ -159,15 +159,111 @@ def start_token_sync() -> None:
         log(f"token-sync 拉起失败：{e}")
 
 
+# ---------------- AutoClaw 客户端守护 ----------------
+# 凭据 account-credentials.enc 只有客户端自己会续。客户端一关，凭据到期就是 401，
+# 反代这边再怎么重启也没用（只能读到那份旧的 enc）。所以客户端也得守着。
+AUTOCLAW_EXE_CANDIDATES = [
+    r"D:\autoclaw\AutoClaw2\AutoClaw2.exe",
+    r"C:\Users\Administrator\AppData\Local\Programs\AutoClaw2\AutoClaw2.exe",
+]
+ENC_GLOB = r"C:\Users\Administrator\AppData\Roaming\AutoClaw-official\accounts"
+
+
+def autoclaw_exe():
+    for p in AUTOCLAW_EXE_CANDIDATES:
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def autoclaw_running() -> bool:
+    """2.x 进程名是 AutoClaw2.exe，1.x 是 AutoClaw.exe，两个都认。"""
+    for name in ("AutoClaw2.exe", "AutoClaw.exe"):
+        try:
+            r = subprocess.run(
+                ["tasklist", "/FI", f"IMAGENAME eq {name}", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, timeout=20,
+                encoding="utf-8", errors="replace",
+                creationflags=0x08000000,
+            )
+            if name.lower() in (r.stdout or "").lower():
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def start_autoclaw() -> None:
+    exe = autoclaw_exe()
+    if not exe:
+        log("找不到 AutoClaw2.exe，跳过客户端拉起")
+        return
+    log(f"AutoClaw 客户端未运行 -> 拉起（{exe}）")
+    try:
+        subprocess.Popen([exe], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         creationflags=detached_flags(), close_fds=True)
+    except Exception as e:
+        log(f"AutoClaw 拉起失败：{e}")
+
+
+def token_seconds_left():
+    """读 request-headers.json 里的 JWT exp，返回剩余秒数；读不到返回 None。"""
+    import base64
+    import json as _json
+    try:
+        h = _json.loads((Path(os.path.expanduser("~")) / ".openclaw-autoclaw"
+                         / "request-headers.json").read_text(encoding="utf-8"))
+        tok = (h.get("headers") or h)["X-Authorization"].split(" ", 1)[1]
+        seg = tok.split(".")[1]
+        seg += "=" * (-len(seg) % 4)
+        exp = _json.loads(base64.urlsafe_b64decode(seg))["exp"]
+        return exp - time.time()
+    except Exception:
+        return None
+
+
+def refresh_credentials(force=False):
+    """
+    把 enc 里的新凭据搬到 request-headers.json。
+    剩余 < 30 分钟（或 force）才动手，避免每轮都读 DPAPI。
+    """
+    left = token_seconds_left()
+    if not force and left is not None and left > 1800:
+        return
+    try:
+        r = subprocess.run([PY, "token-sync.py", "--once"], cwd=str(RELAY_DIR),
+                           capture_output=True, text=True, timeout=90,
+                           encoding="utf-8", errors="replace",
+                           creationflags=0x08000000)
+        msg = (r.stdout or r.stderr or "").strip().splitlines()
+        log(f"凭据刷新：{msg[-1] if msg else '无输出'}")
+    except Exception as e:
+        log(f"凭据刷新失败：{e}")
+
+
 def main() -> None:
     PIDFILE.write_text(str(os.getpid()), encoding="utf-8")
     log(f"supervisor 启动（Python 版，pid {os.getpid()}，端口 {PORT}，每 {INTERVAL}s 自查）")
 
+    # 启动时先把凭据刷一遍，避免拿着过期 token 空转
+    refresh_credentials(force=True)
+
     while True:
         try:
+            # 1) AutoClaw 客户端：它是凭据的唯一续期来源，必须活着
+            if not autoclaw_running():
+                start_autoclaw()
+                time.sleep(15)   # 给客户端一点时间落 enc
+
+            # 2) 凭据：剩余不足 30 分钟就搬一次
+            refresh_credentials()
+
+            # 3) 反代端口
             if not port_alive():
                 start_relay()
 
+            # 4) 续期器
             if not pid_alive(read_pid_file(RELAY_DIR / "token-sync.pid")):
                 start_token_sync()
 
@@ -181,8 +277,11 @@ def main() -> None:
 if __name__ == "__main__":
     # 单次模式，方便手工验证：python supervisor.py --once
     if "--once" in sys.argv:
-        print("port_alive:", port_alive())
-        print("token-sync pid:", read_pid_file(RELAY_DIR / "token-sync.pid"),
+        print("port_alive       :", port_alive())
+        print("autoclaw_running :", autoclaw_running())
+        print("token-sync pid   :", read_pid_file(RELAY_DIR / "token-sync.pid"),
               "alive:", pid_alive(read_pid_file(RELAY_DIR / "token-sync.pid")))
+        left = token_seconds_left()
+        print("token 剩余       :", f"{left/3600:.2f} 小时" if left is not None else "读取失败")
         sys.exit(0)
     main()

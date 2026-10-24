@@ -281,18 +281,29 @@ const pidCache = { pids: new Set(), at: 0 };
 const netstatCache = { out: "", at: 0 };
 let brokerInflight = null;
 
+// 进程名要两种都认：1.x 叫 AutoClaw.exe，2.x 装出来叫 AutoClaw2.exe。
+// 只查 AutoClaw.exe 时 2.x 永远匹配不到 → pids 恒为空 → broker 发现直接跳过
+// netstat 环节（candidatePorts 里 `if (pids.size)`），health 的 autoclawRunning
+// 也永远 false。云线路（CLOUD_LANE=cn）不依赖 broker，所以业务能跑通，
+// 但进程态检测是坏的。
+const AUTOCLAW_IMAGE_NAMES = ["AutoClaw.exe", "AutoClaw2.exe"];
+
 function autoclawPidsScan() {
-  try {
-    const out = execFileSync("tasklist", ["/FI", "IMAGENAME eq AutoClaw.exe", "/FO", "CSV"], {
-      encoding: "utf8", timeout: 15_000, windowsHide: true,
-    });
-    const pids = new Set();
+  const pids = new Set();
+  for (const name of AUTOCLAW_IMAGE_NAMES) {
+    let out = "";
+    try {
+      out = execFileSync("tasklist", ["/FI", `IMAGENAME eq ${name}`, "/FO", "CSV"], {
+        encoding: "utf8", timeout: 15_000, windowsHide: true,
+      });
+    } catch { continue; }
+    // 进程名里可能带空格/特殊字符，按 CSV 首列整体匹配再取第二列 pid
     for (const line of out.split(/\r?\n/)) {
-      const m = /^"AutoClaw\.exe"\s*,\s*"(\d+)"/.exec(line);
-      if (m) pids.add(m[1]);
+      const m = /^"([^"]+)"\s*,\s*"(\d+)"/.exec(line);
+      if (m && m[1].toLowerCase() === name.toLowerCase()) pids.add(m[2]);
     }
-    return pids;
-  } catch { return new Set(); }
+  }
+  return pids;
 }
 
 function autoclawPids() {

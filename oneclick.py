@@ -264,51 +264,33 @@ endlocal
 """
     (RELAY_DIR / "start-relay.cmd").write_text(start, encoding="utf-8")
 
-    sup = f"""@echo off
+    # 守护用 Python 版，不再生成 supervisor.cmd。
+    # 老 .cmd 版的健康检测 findstr /R /C:":PORT .*LISTENING" 在 cmd 下把 /C: 当"从文件读"，
+    # 去找名为 `.*LISTENING"` 的文件 → 报错 → errorlevel 恒 1 → 每 5 分钟无条件重启反代
+    # → EADDRINUSE 自杀 + 多实例互踩，反代反复掉线。Python 版用 socket 真连端口判定。
+    sup_src = (ASSETS / "supervisor.py").read_text(encoding="utf-8", errors="replace")
+    sup_src = (sup_src
+               .replace(r"C:\Users\Administrator\.autoclaw-relay", str(RELAY_DIR))
+               .replace("PORT = 18766", f"PORT = {PORT}"))
+    (RELAY_DIR / "supervisor.py").write_text(sup_src, encoding="utf-8")
+
+    # 开机自启入口：拉起 Python 守护
+    auto = f"""@echo off
 setlocal
-set RELAY_DIR={RELAY_DIR}
-set NODE={node}
 set PY={py}
-set http_proxy=
-set https_proxy=
-set HTTP_PROXY=
-set HTTPS_PROXY=
-set all_proxy=
-set ALL_PROXY=
-set no_proxy=127.0.0.1,localhost
-set NO_PROXY=127.0.0.1,localhost
-title AutoClaw 反代守护
-echo AutoClaw 反代守护运行中（每 5 分钟自查，可最小化，关窗口即停止守护）
-:loop
-  netstat -ano | findstr /R /C:":{PORT} .*LISTENING" >nul 2>&1
-  if errorlevel 1 (
-    echo [%time%] 反代未运行，拉起中...
-    echo [%date% %time%] relay down >> "%RELAY_DIR%\\keepalive.log"
-    call "%RELAY_DIR%\\start-relay.cmd" >nul 2>&1
-  )
-  set SPID=
-  if exist "%RELAY_DIR%\\token-sync.pid" set /p SPID=<"%RELAY_DIR%\\token-sync.pid"
-  if not defined SPID goto :start_sync
-  tasklist /FI "PID eq %SPID%" 2>nul | findstr /I "python" >nul 2>&1
-  if errorlevel 1 goto :start_sync
-  goto :sleep
-  :start_sync
-  echo [%time%] 续期器未运行，拉起中...
-  echo [%date% %time%] token-sync down >> "%RELAY_DIR%\\keepalive.log"
-  cd /d "%RELAY_DIR%"
-  start "autoclaw-token-sync" /min "%PY%" token-sync.py
-  :sleep
-  timeout /t 300 /nobreak >nul
-  goto :loop
+set RELAY_DIR={RELAY_DIR}
+start "autoclaw-supervisor" /min "%PY%" "%RELAY_DIR%\\supervisor.py"
+endlocal
 """
-    (RELAY_DIR / "supervisor.cmd").write_text(sup, encoding="utf-8")
-    return True, "start-relay.cmd / supervisor.cmd / token-sync.py"
+    (RELAY_DIR / "autostart-supervisor.cmd").write_text(auto, encoding="utf-8")
+    return True, "start-relay.cmd / supervisor.py / autostart-supervisor.cmd / token-sync.py"
 
 
 def install_autostart():
     STARTUP_DIR.mkdir(parents=True, exist_ok=True)
     dst = STARTUP_DIR / AUTOSTART_NAME
-    shutil.copy2(RELAY_DIR / "supervisor.cmd", dst)
+    # 自启入口拉的是 Python 守护（supervisor.py），不是旧的 supervisor.cmd
+    shutil.copy2(RELAY_DIR / "autostart-supervisor.cmd", dst)
     return True, str(dst)
 
 

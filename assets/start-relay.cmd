@@ -2,7 +2,10 @@
 setlocal
 set RELAY_DIR=C:\Users\Administrator\.autoclaw-relay
 set NODE=C:\Users\Administrator\.workbuddy\binaries\node\versions\22.22.2-6\node.exe
-set PY=C:\Users\Administrator\.workbuddy\binaries\python\envs\default\Scripts\python.exe
+set PYW=C:\Users\Administrator\.workbuddy\binaries\python\envs\default\Scripts\pythonw.exe
+rem pythonw = GUI 子系统，不分配控制台 —— 换成 python.exe 每次拉起都会闪一个黑窗口
+set PY=%PYW%
+if not exist "%PY%" set PY=C:\Users\Administrator\.workbuddy\binaries\python\versions\3.13.12\pythonw.exe
 set http_proxy=
 set https_proxy=
 set HTTP_PROXY=

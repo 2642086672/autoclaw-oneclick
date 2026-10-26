@@ -27,7 +27,13 @@ from pathlib import Path
 
 RELAY_DIR = Path(r"C:\Users\Administrator\.autoclaw-relay")
 NODE = r"C:\Users\Administrator\.workbuddy\binaries\node\versions\22.22.2-6\node.exe"
-PY = r"C:\Users\Administrator\.workbuddy\binaries\python\envs\default\Scripts\python.exe"
+# 用 pythonw.exe（Windows GUI 子系统，不分配控制台）。
+# 换成 python.exe 的话，每被拉起一次都会闪一个黑色控制台窗口 —— 用户就是为这个来的。
+# pythonw 没有控制台，stdout/stderr 一律丢弃（重定向到 DEVNULL）。
+PYW = r"C:\Users\Administrator\.workbuddy\binaries\python\envs\default\Scripts\pythonw.exe"
+if not os.path.isfile(PYW):
+    PYW = r"C:\Users\Administrator\.workbuddy\binaries\python\versions\3.13.12\pythonw.exe"
+PY = PYW
 PORT = 18766
 INTERVAL = 30          # 秒。反代掉线时人是在用着的，5 分钟等于干等
 LOG = RELAY_DIR / "keepalive.log"
@@ -104,37 +110,67 @@ def start_relay() -> bool:
     try:
         subprocess.run([PY, "token-sync.py", "--once"], cwd=str(RELAY_DIR),
                        capture_output=True, timeout=60,
-                       creationflags=0x08000000)
+                       creationflags=NO_WINDOW)
     except Exception as e:
         log(f"token-sync --once 失败：{e}")
 
-    env = dict(os.environ)
-    env.update({
-        "AUTOCLAW_BIND_HOST": "127.0.0.1",
-        "AUTOCLAW_PORT": str(PORT),
-        "AUTOCLAW_CONTRACT": "2x",
-        "AUTOCLAW_CLOUD_LANE": "cn",
-        "AUTOCLAW_CLIENT_VERSION": "2.2.0.308",
-        "AUTOCLAW_X_CHANNEL": "official",
-        "AUTOCLAW_X_TRACE_ID": "autoclaw-desktop",
-        "AUTOCLAW_HARNESS_MARKER": "0",
-        "AUTOCLAW_MAX_OUTPUT_TOKENS": "0",
-        "AUTOCLAW_LOG_FILE": str(RELAY_DIR / "server.log"),
-    })
+    # 反代需要一堆环境变量，WMI 传不了 env，所以先写一个一次性 .cmd，
+    # 再用 WMI 拉它 —— 这样既带上环境变量，又脱离当前进程树。
+    key = ""
     key_file = RELAY_DIR / "api-key.txt"
     if key_file.is_file():
-        env["AUTOCLAW_INBOUND_KEYS"] = key_file.read_text(encoding="utf-8").strip()
+        key = key_file.read_text(encoding="utf-8").strip()
+    launcher = RELAY_DIR / "_launch-relay.cmd"
+    launcher.write_text(
+        "@echo off\r\n"
+        f"set RELAY_DIR={RELAY_DIR}\r\n"
+        f"set NODE={NODE}\r\n"
+        f"set AUTOCLAW_BIND_HOST=127.0.0.1\r\n"
+        f"set AUTOCLAW_PORT={PORT}\r\n"
+        "set AUTOCLAW_CONTRACT=2x\r\n"
+        "set AUTOCLAW_CLOUD_LANE=cn\r\n"
+        "set AUTOCLAW_CLIENT_VERSION=2.2.0.308\r\n"
+        "set AUTOCLAW_X_CHANNEL=official\r\n"
+        "set AUTOCLAW_X_TRACE_ID=autoclaw-desktop\r\n"
+        "set AUTOCLAW_HARNESS_MARKER=0\r\n"
+        "set AUTOCLAW_MAX_OUTPUT_TOKENS=0\r\n"
+        f"set AUTOCLAW_INBOUND_KEYS={key}\r\n"
+        f"set AUTOCLAW_LOG_FILE={RELAY_DIR}\\server.log\r\n"
+        'set no_proxy=127.0.0.1,localhost\r\n'
+        'set NO_PROXY=127.0.0.1,localhost\r\n'
+        "cd /d \"%RELAY_DIR%\"\r\n"
+        'start "" /min "%NODE%" server.mjs\r\n',
+        encoding="utf-8")
 
-    logf = open(RELAY_DIR / "server.log", "a", encoding="utf-8")
-    try:
-        p = subprocess.Popen(
-            [NODE, "server.mjs"], cwd=str(RELAY_DIR), env=env,
-            stdin=subprocess.DEVNULL, stdout=logf, stderr=subprocess.STDOUT,
-            creationflags=detached_flags(), close_fds=True,
-        )
-        (RELAY_DIR / "relay.pid").write_text(str(p.pid), encoding="utf-8")
-    finally:
-        logf.close()
+    pid = _spawn_via_wmi(launcher, workdir=str(RELAY_DIR))
+    if not pid:
+        # WMI 失败时退回直接启动（至少有窗口但不至于起不来）
+        log("WMI 拉起反代失败，退回 Popen")
+        logf = open(RELAY_DIR / "server.log", "a", encoding="utf-8")
+        env = dict(os.environ)
+        env.update({
+            "AUTOCLAW_BIND_HOST": "127.0.0.1",
+            "AUTOCLAW_PORT": str(PORT),
+            "AUTOCLAW_CONTRACT": "2x",
+            "AUTOCLAW_CLOUD_LANE": "cn",
+            "AUTOCLAW_CLIENT_VERSION": "2.2.0.308",
+            "AUTOCLAW_X_CHANNEL": "official",
+            "AUTOCLAW_X_TRACE_ID": "autoclaw-desktop",
+            "AUTOCLAW_HARNESS_MARKER": "0",
+            "AUTOCLAW_MAX_OUTPUT_TOKENS": "0",
+            "AUTOCLAW_LOG_FILE": str(RELAY_DIR / "server.log"),
+        })
+        if key:
+            env["AUTOCLAW_INBOUND_KEYS"] = key
+        try:
+            p = subprocess.Popen(
+                [NODE, "server.mjs"], cwd=str(RELAY_DIR), env=env,
+                stdin=subprocess.DEVNULL, stdout=logf, stderr=subprocess.STDOUT,
+                creationflags=detached_flags(), close_fds=True,
+            )
+            (RELAY_DIR / "relay.pid").write_text(str(p.pid), encoding="utf-8")
+        finally:
+            logf.close()
 
     # 等端口真的起来（最多 20 秒）
     for _ in range(40):
@@ -193,6 +229,81 @@ def autoclaw_running() -> bool:
     return False
 
 
+def _acquire_singleton_lock():
+    """
+    单实例保护：只允许一个 supervisor。
+
+    为什么需要：计划任务会反复拉起 supervisor。多实例并存时会互相抢着拉
+    token-sync / 客户端，每 30 秒就多一个进程 —— 每个都闪控制台窗口。
+    用独占文件锁（O_EXCL|O_CREAT），已存在则说明有别的实例在跑。
+    """
+    try:
+        fd = os.open(str(LOCKFILE), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        # 可能是上次异常退出留下的残锁。检查锁里记的 pid 是否还活着，
+        # 死了就当作残锁清掉重来。
+        try:
+            old = LOCKFILE.read_text(encoding="utf-8").strip()
+            old_pid = int(old)
+        except Exception:
+            return False
+        if old_pid and old_pid != os.getpid() and _pid_exists(old_pid):
+            return False
+        # 残锁，清掉重试一次
+        try:
+            LOCKFILE.unlink()
+        except Exception:
+            return False
+        try:
+            fd = os.open(str(LOCKFILE), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            return False
+    os.write(fd, str(os.getpid()).encode())
+    os.close(fd)
+    return True
+
+
+def _spawn_via_wmi(exe_path, args="", workdir=None):
+    """
+    用 WMI 拉起进程，脱离当前进程树。
+
+    supervisor 自己也是被计划任务/会话拉起的，若用 Popen，子进程和 supervisor
+    在同一个作业对象里 —— supervisor 被收走时，子进程跟着一起死。
+    WMI 创建的进程挂在 wmiprvse.exe 名下，不受这个作业对象约束。
+    """
+    cmdline = (f'"{exe_path}" {args}'.strip()).replace("'", "''")
+    q = "'" + cmdline + "'"
+    if workdir:
+        wd = "'" + workdir.replace("'", "''") + "'"
+        ps = ("$r = ([wmiclass]'root\\cimv2:Win32_Process').Create(%s, %s); "
+              "if ($r.ReturnValue -eq 0) { $r.ProcessId } else { -1 }") % (q, wd)
+    else:
+        ps = ("$r = ([wmiclass]'root\\cimv2:Win32_Process').Create(%s); "
+              "if ($r.ReturnValue -eq 0) { $r.ProcessId } else { -1 }") % q
+    try:
+        r = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps],
+            capture_output=True, text=True, timeout=90, creationflags=NO_WINDOW)
+        pid = int((r.stdout or "-1").strip().splitlines()[-1])
+        return pid if pid > 0 else None
+    except Exception as e:
+        log(f"WMI 拉起失败：{e}")
+        return None
+
+
+def _pid_exists(pid: int) -> bool:
+    """按 pid 判断进程是否存在（用于识别残锁）。"""
+    if not pid or pid <= 0:
+        return False
+    try:
+        r = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                           capture_output=True, text=True, timeout=20,
+                           creationflags=NO_WINDOW)
+        return f'"{pid}"' in (r.stdout or "")
+    except Exception:
+        return False
+
+
 def start_autoclaw() -> None:
     exe = autoclaw_exe()
     if not exe:
@@ -223,6 +334,33 @@ def token_seconds_left():
         return None
 
 
+def _acquire_singleton_lock() -> bool:
+    """
+    只允许一个 supervisor 实例。
+
+    用 msvcrt 锁一个独占文件：谁拿到锁谁跑，其它实例直接退出。
+    为什么必要：计划任务每 5 分钟触发一次，触发器叠加时可能并存多个 supervisor。
+    多实例会互相抢着拉 token-sync → 每 30 秒重复启动一次 → 反复闪黑窗口。
+    """
+    import msvcrt
+    lock_file = RELAY_DIR / "supervisor.lock"
+    try:
+        fh = open(lock_file, "w")
+        msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        # 保持文件句柄打开，锁就一直是我们的
+        _SINGLETON_HANDLE.append(fh)
+        return True
+    except Exception:
+        try:
+            fh.close()
+        except Exception:
+            pass
+        return False
+
+
+_SINGLETON_HANDLE = []
+
+
 def refresh_credentials(force=False):
     """
     把 enc 里的新凭据搬到 request-headers.json。
@@ -249,8 +387,19 @@ def main() -> None:
     # 启动时先把凭据刷一遍，避免拿着过期 token 空转
     refresh_credentials(force=True)
 
+    # 单实例保护：只允许一个 supervisor。
+    # 计划任务每 5 分钟会再拉一个起来（任务设置是 IgnoreNew，但触发器叠加时
+    # 仍可能并存）。多实例会互相抢着拉 token-sync → 每 30 秒弹一个黑窗口。
+    if not _acquire_singleton_lock():
+        log("已有 supervisor 在运行，本实例退出（避免重复拉起导致黑窗口）")
+        return
+
+    last_sync_at = 0.0
+
     while True:
         try:
+            now = time.time()
+
             # 1) AutoClaw 客户端：它是凭据的唯一续期来源，必须活着
             if not autoclaw_running():
                 start_autoclaw()
@@ -263,8 +412,10 @@ def main() -> None:
             if not port_alive():
                 start_relay()
 
-            # 4) 续期器
-            if not pid_alive(read_pid_file(RELAY_DIR / "token-sync.pid")):
+            # 4) 续期器：拉起后至少等 2 分钟再复查（进程启动慢，立刻查会误判成死了）
+            if (not pid_alive(read_pid_file(RELAY_DIR / "token-sync.pid"))
+                    and now - last_sync_at > 120):
+                last_sync_at = now
                 start_token_sync()
 
         except Exception as e:
